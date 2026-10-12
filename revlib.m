@@ -1,0 +1,621 @@
+function L = revlib()
+%REVLIB  Function library for the revised bit-loading simulations.
+%
+%   L = REVLIB() returns a struct of function handles.
+%
+%   Available functions
+%     L.constellation(M, family)      -> unit-energy constellation points
+%     L.const_params(M, family)       -> minimum distance and mean number
+%                                        of nearest neighbours
+%     L.ref_gap(SER, M, family)       -> reference SNR gap (linear)
+%     L.ser_of_gamma(gamma, M, family)-> symbol error rate at a given SNR
+%     L.gap_eq16(SER, M)              -> proposed approximation, Eq. (16)
+%     L.alloc_proposed(g, P)          -> proposed multi-gap algorithm
+%     L.alloc_constant(g, P)          -> constant-gap baseline (EBF)
+%     L.alloc_hh(g, P)                -> Hughes-Hartogs, exhaustive ref.
+%     L.alloc_uniform(g, P)           -> uniform loading, lower reference
+%     L.alloc_greedy_fill(g, P)       -> greedy bit filling, constant gap
+%     L.alloc_greedy_remove(g, P)     -> greedy bit removal, constant gap
+%     L.achieved_ser(b, Pk, g, P)     -> SER actually achieved per level
+%
+%   MODEL
+%     All allocators share the same interface:
+%       [b, Pk, ops] = alloc_xxx(g, P)
+%     with g the 1xN gain-to-noise vector, P the config struct, b the
+%     1xN integer bit allocation, Pk the 1xN allocated power (W) and ops
+%     a struct of measured operation counts 
+%
+%
+%   Author : H. Ait-Saadi 
+
+L.constellation = @constellation;
+L.const_params  = @const_params;
+L.ref_gap       = @ref_gap;
+L.ser_of_gamma  = @ser_of_gamma;
+L.gap_eq16      = @gap_eq16;
+L.alloc_proposed= @alloc_proposed;
+L.alloc_constant= @alloc_constant;
+L.alloc_hh      = @alloc_hh;
+L.alloc_uniform = @alloc_uniform;
+L.alloc_papandreou = @alloc_papandreou;
+L.alloc_greedy_fill   = @alloc_greedy_fill;
+L.alloc_greedy_remove = @alloc_greedy_remove;
+L.achieved_ser  = @achieved_ser;
+end
+
+%% ======================================================================
+%  CONSTELLATION UTILITIES
+%% ======================================================================
+
+function c = constellation(M, family)
+%CONSTELLATION  Unit average energy constellation points.
+if strcmpi(family,'psk')
+    c = exp(1j*2*pi*(0:M-1)/M);              % already unit energy
+else
+    c = qammod((0:M-1).', M, 'UnitAveragePower', true);  % Comm. Toolbox
+    c = c(:).';
+end
+end
+
+function [dmin, Nn] = const_params(M, family)
+%CONST_PARAMS  Minimum distance and mean number of nearest neighbours.
+%   Memoised: ACHIEVED_SER calls this once per level and per realization,
+%   and the pairwise distance matrix is MxM. Without the cache, adding
+%   128QAM and 256QAM would dominate the run time.
+persistent cache
+if isempty(cache); cache = containers.Map('KeyType','char','ValueType','any'); end
+key = sprintf('%s_%d', lower(family), M);
+if isKey(cache, key)
+    v = cache(key); dmin = v(1); Nn = v(2); return;
+end
+c = constellation(M, family);
+D = abs(c(:) - c(:).');                      % pairwise distance matrix
+D(1:M+1:end) = Inf;                          % discard self-distances
+dmin = min(D(:));
+tol  = 1e-6 * dmin;
+Nn   = mean(sum(D <= dmin + tol, 2));        % averaged over all symbols
+cache(key) = [dmin Nn];
+end
+
+function s = ser_of_gamma(gam, M, family)
+%SER_OF_GAMMA  Nearest-neighbour symbol error rate at SNR gam (linear).
+[dmin, Nn] = const_params(M, family);
+s = Nn .* qfun(dmin .* sqrt(gam/2));
+end
+
+function G = ref_gap(SER, M, family)
+%REF_GAP  Reference SNR gap (linear) achieving SER with M points.
+%   Inverting SER = Nn*Q(dmin*sqrt(gamma/2)) gives
+%       gamma = 2*[Q^{-1}(SER/Nn)]^2 / dmin^2,   Gamma = gamma/(M-1).
+[dmin, Nn] = const_params(M, family);
+gam = 2*(qfuninv(SER/Nn)^2) / dmin^2;
+G   = gam / (M-1);
+end
+
+function G = gap_eq16(SER, M)
+%GAP_EQ16  Proposed M-PSK gap approximation, Eq. (16) of the manuscript.
+G = -log(5*SER) ./ ((M-1) .* sin(pi./M).^2);
+end
+
+function y = qfun(x)
+y = 0.5*erfc(x/sqrt(2));
+end
+
+function x = qfuninv(p)
+x = sqrt(2)*erfcinv(2*p);
+end
+
+%% ======================================================================
+%  ALLOCATION ALGORITHMS
+%% ======================================================================
+
+function [b, Pk, ops] = alloc_proposed(g, P)
+
+
+N = P.N; Bt = P.Bt; Gap = P.Gap_l; L = numel(Gap);
+ops = zeros_ops();
+
+% --- bit caps per gap level, Eq. (17) --------------------------------
+
+Lrows = numel(unique(Gap(:)));
+cap = min(P.bmax, floor(log2(1 + (P.Pbar*g(:).')./Gap(:))));   % L x N
+ops.div = ops.div + Lrows*N;             % one division per distinct entry
+ops.cmp = ops.cmp + Lrows*N;             % the min(bmax,.) test
+bbar = max(cap(:));
+ops.cmp = ops.cmp + Lrows*N - 1;         % search for L_max, Eq. (18)
+if bbar < 1
+    b = zeros(1,N); Pk = zeros(1,N); return;
+end
+
+% --- largest feasible rate under the per-sub-channel constraint --------
+% The largest number of bits sub-channel k can actually carry is the
+% largest level l satisfying l <= cap(l,k): the cap must hold at the
+% level the bits would create, not at some lower one. Summing gives the
+% maximum feasible rate. If the target exceeds it, the target is
+% infeasible under Pbar and the algorithm delivers the maximum instead;
+% the rate actually achieved is returned in b and must be reported.
+bfeas = zeros(1,N);
+for l = 1:L
+    bfeas(cap(l,:) >= l) = l;
+end
+ops.cmp = ops.cmp + L*N;
+Bfeas = sum(bfeas);
+Bt    = min(Bt, Bfeas);
+ops.cmp = ops.cmp + 1;
+
+c = floor(Bt/bbar);  d = mod(Bt,bbar);
+ops.div = ops.div + 1;
+
+b     = zeros(1,N);
+lev   = ones(1,N);              % active gap level per sub-channel
+capk  = cap(1,:);               % current bit cap
+T     = zeros(1,N);             % power already committed
+dP    = Gap(1) ./ g;            % incremental power, Eq. (24)
+ops.div = ops.div + N;
+% Sub-channels that cannot carry even one bit are excluded from the very
+% first selection. Without this the first bit escapes the saturation
+% test, which only protects the bits that follow it.
+dP(bfeas < 1) = Inf;
+ops.cmp = ops.cmp + N;
+
+for it = 1:bbar
+    [~, idx] = sort(dP);
+    ops.cmp = ops.cmp + (N-1)*log2(N) + 0.1*N;      % weak-heap sort cost
+
+    nsel = min(c, N);
+    S = idx(1:nsel);
+    S = S(isfinite(dP(S)));                          % feasibility guard
+    ops.cmp = ops.cmp + nsel;                        % one isfinite test each
+    ops.cmp = ops.cmp + 1;                           % test S == empty
+    if isempty(S); break; end
+
+    b(S) = b(S) + 1;
+    ops.add = ops.add + numel(S);
+
+    for i = S
+        % lev(i) = b(i)+1 holds identically throughout the loop, so the
+        % level index is NOT charged as a separate addition: a real
+        % implementation reads Gamma_{b_k+1} from the bit just written.
+        % Only the clamp against L is an operation of its own.
+        lev(i)  = min(lev(i)+1, L);                  % Step 8a
+        ops.cmp = ops.cmp + 1;                       % the min(.,L) clamp
+        capk(i) = cap(lev(i), i);
+        ops.shift = ops.shift + 1;                   % read of B^cap
+        ops.cmp   = ops.cmp + 1;                     % saturation test
+        if b(i) < capk(i)                            % Step 8b
+            T(i)  = T(i) + dP(i);
+            dP(i) = (2^lev(i) - 1)*Gap(lev(i))/g(i) - T(i);
+            ops.add = ops.add + 2;  ops.div = ops.div + 1;
+            ops.shift = ops.shift + 1;   % read of u_l = (2^l-1)*Gap_l
+        else                                         % Step 8c
+            dP(i) = Inf;
+        end
+    end
+end
+
+% --- remainder step ---------------------------------------------------
+if d > 0
+    [~, idx] = sort(dP);
+    ops.cmp = ops.cmp + d*(N-1);      % selection of the d smallest entries
+    R = idx(1:min(d,N));
+    R = R(isfinite(dP(R)));
+    b(R) = b(R) + 1;
+end
+
+b  = min(b, P.bmax);
+ops.cmp = ops.cmp + N;                % the min(b, bmax) clamp
+Pk = power_from_bits(b, g, Gap);
+ops.cmp   = ops.cmp + N;              % the b > 0 test
+ops.div   = ops.div + sum(b > 0);     % one division per active sub-channel
+ops.shift = ops.shift + 2*sum(b > 0); % 2^b and the read of Gap(b)
+ops.add   = ops.add + sum(b > 0);     % the -1
+end
+
+% ----------------------------------------------------------------------
+
+function [b, Pk, ops] = alloc_constant(g, P)
+%ALLOC_CONSTANT  Constant-gap baseline (EBF-type, Wang et al.).
+%   Identical to ALLOC_PROPOSED except that a single gap value is used for
+%   every modulation level. 
+Q = P;
+Q.Gap_l = P.Gap_const * ones(1, P.bmax);
+[b, Pk, ops] = alloc_proposed(g, Q);
+% Pk is the power this algorithm BELIEVES it needs, computed with the
+% constant gap. ACHIEVED_SER then evaluates the error rate that this power
+% actually produces on each constellation, which is where the constraint
+% violation of the constant-gap assumption becomes visible.
+end
+
+% ----------------------------------------------------------------------
+
+function [b, Pk, ops] = alloc_hh(g, P)
+%ALLOC_HH  Hughes-Hartogs greedy loading: one bit at a time.
+%   Allocates each bit to the sub-channel requiring the least incremental
+%   power. Under a CONSTANT gap this yields the minimum-power discrete
+%   allocation; under the level-dependent gap used here that guarantee no
+%   longer holds, so it serves as an exhaustive one-bit-at-a-time
+
+
+N = P.N; Gap = P.Gap_l; L = numel(Gap);
+ops = zeros_ops();
+
+
+Lrows = numel(unique(Gap(:)));
+cap = min(P.bmax, floor(log2(1 + (P.Pbar*g(:).')./Gap(:))));
+ops.div = ops.div + Lrows*N;
+ops.cmp = ops.cmp + Lrows*N;
+capk = cap(1,:);
+bfeas = zeros(1,N);
+for l = 1:L
+    bfeas(cap(l,:) >= l) = l;
+end
+ops.cmp = ops.cmp + L*N;
+Bt_eff = min(P.Bt, sum(bfeas));
+
+b = zeros(1,N); T = zeros(1,N); lev = ones(1,N);
+dP = Gap(1)./g;
+ops.div = ops.div + N;
+dP(bfeas < 1) = Inf;             % same first-bit guard as ALLOC_PROPOSED
+ops.cmp = ops.cmp + N;
+
+for n = 1:Bt_eff
+    [mv, i] = min(dP);
+    ops.cmp = ops.cmp + (N-1);
+    ops.cmp = ops.cmp + 1;                       % the isfinite test
+    if ~isfinite(mv); break; end                 % no feasible sub-channel
+
+    b(i) = b(i) + 1;
+    lev(i) = min(lev(i)+1, L);
+    ops.add = ops.add + 1;                       % b+1 only; lev = b+1
+    ops.cmp = ops.cmp + 1;                       % the min(.,L) clamp
+    capk(i) = cap(lev(i), i);
+    ops.shift = ops.shift + 1;                   % read of B^cap
+    ops.cmp = ops.cmp + 1;                       % saturation test
+
+    if b(i) < capk(i)
+        % ALLOC_HH runs on the MULTI-LEVEL gap table, so the doubling
+        % shortcut does not apply here: the general recursion must be
+        % evaluated. Replacing it by dP <- 2*dP would change the
+        % allocation itself, not merely its cost.
+        T(i)  = T(i) + dP(i);
+        dP(i) = (2^lev(i) - 1)*Gap(lev(i))/g(i) - T(i);
+        ops.add = ops.add + 2; ops.div = ops.div + 1;
+        ops.shift = ops.shift + 1;               % read of u_l
+    else
+        dP(i) = Inf;
+    end
+end
+
+b  = min(b, P.bmax);
+ops.cmp = ops.cmp + N;
+Pk = power_from_bits(b, g, Gap);
+ops.cmp   = ops.cmp + N;
+ops.div   = ops.div + sum(b > 0);
+ops.shift = ops.shift + 2*sum(b > 0);
+ops.add   = ops.add + sum(b > 0);
+end
+
+% ----------------------------------------------------------------------
+
+function [b, Pk, ops] = alloc_uniform(g, P)
+%ALLOC_UNIFORM  Uniform bit loading, used as a lower reference.
+%   Every usable sub-channel receives the same number of bits; the
+%   remainder is placed on the strongest sub-channels.
+N = P.N; Gap = P.Gap_l;
+ops = zeros_ops();
+
+b0 = floor(P.Bt/N);
+b  = b0*ones(1,N);
+r  = P.Bt - b0*N;
+ops.div = ops.div + 1;
+[~, idx] = sort(g, 'descend');
+ops.cmp = ops.cmp + (N-1)*log2(N) + 0.1*N;
+b(idx(1:r)) = b(idx(1:r)) + 1;
+ops.add = ops.add + r;
+b = min(b, P.bmax);
+ops.cmp = ops.cmp + N;
+
+% Same final-assignment charge as the other allocators (comment R1-C7).
+Pk = power_from_bits(b, g, Gap);
+ops.cmp   = ops.cmp + N;
+ops.div   = ops.div + sum(b > 0);
+ops.shift = ops.shift + 2*sum(b > 0);
+ops.add   = ops.add + sum(b > 0);
+end
+
+% ----------------------------------------------------------------------
+
+function [b, Pk, ops] = alloc_papandreou(g, P)
+%ALLOC_PAPANDREOU  Efficient discrete margin-maximisation loading.
+%
+%   Implementation of the low-complexity discrete loading algorithm of
+%   Papandreou and Antonakopoulos, EURASIP JASP 2008, article 643081:
+%   the characteristic bit-allocation profile of Eq. (36), Section 5.2,
+%   followed by the multiple-bit shifting procedure of Algorithm 4,
+%   Section 6.2, and a final greedy step for the residual bits.
+%
+%   As in that reference, the SNR gap is absorbed into the gain-to-noise
+%   ratios and is therefore CONSTANT across sub-channels. This algorithm
+%   is thus a second, independent representative of the constant-gap
+%   family, and is expected to exhibit the same error-rate constraint
+%   violation as the EBF baseline on the M-PSK levels.
+%
+
+
+N = P.N; Bt = P.Bt; Gc = P.Gap_const;
+ops = zeros_ops();
+
+% ---- bit caps under the constant gap -------------------------------
+% Constant gap: a single row of caps is needed (Lrows = 1), charged with
+
+cap = min(P.bmax, floor(log2(1 + (P.Pbar*g)/Gc)));
+ops.div = ops.div + N;
+ops.cmp = ops.cmp + N;               % the min(bmax,.) test
+clipf = @(x) min(max(round(x),0), cap);
+
+% ---- characteristic bit profile, Eq. (36) --------------------------
+[~, imax] = max(g);
+[~, imin] = min(g);
+ops.cmp = ops.cmp + 2*(N-1);
+
+k    = g(imax) ./ g;                 % k_i = g_max / g_i  >= 1
+ops.div = ops.div + N;
+kmin = k(imin);                      % largest ratio
+
+bp        = floor(log2(kmin)) - floor(log2(k));
+bp(imax)  = floor(log2(kmin)) + 1;
+
+% ---- multiple-bit shifting, Algorithm 4 ----------------------------
+MAXIT = 50;                          % safety bound
+for it = 1:MAXIT
+    b  = clipf(bp);
+    B0 = sum(b);
+    ops.add = ops.add + N;
+
+    Nstar = sum(b > 0);              % non-zero loaded sub-channels
+    ops.cmp = ops.cmp + N;
+    if Nstar == 0; break; end
+
+    alpha = floor((Bt - B0)/Nstar);
+    ops.div = ops.div + 1;
+    if alpha == 0; break; end
+    bp = bp + alpha;
+end
+b = clipf(bp);
+
+% ---- greedy residual step ------------------------------------------
+% The shifted profile differs from the target rate by at most one bit
+% per sub-channel (Remarks 10-11 of the reference); the residual is
+% therefore settled by a single greedy pass.
+Gvec = Gc * ones(1, P.bmax);
+res  = Bt - sum(b);
+
+if res > 0                            % bit-filling
+    for n = 1:res
+        dP = inf(1,N);
+        m  = b < cap;
+        dP(m) = (2.^b(m)) * Gc ./ g(m);      % Eq. (33) of the reference
+        ops.div = ops.div + sum(m);
+        [mv, i] = min(dP);
+        ops.cmp = ops.cmp + (N-1);
+        if ~isfinite(mv); break; end
+        b(i) = b(i) + 1;
+        ops.add = ops.add + 1;
+    end
+elseif res < 0                        % bit-removal
+    for n = 1:(-res)
+        dP = -inf(1,N);
+        m  = b > 0;
+        dP(m) = (2.^(b(m)-1)) * Gc ./ g(m);  % Eq. (34) of the reference
+        ops.div = ops.div + sum(m);
+        [mv, i] = max(dP);
+        ops.cmp = ops.cmp + (N-1);
+        if ~isfinite(mv); break; end
+        b(i) = b(i) - 1;
+        ops.add = ops.add + 1;
+    end
+end
+
+b  = min(b, P.bmax);
+ops.cmp = ops.cmp + N;
+Pk = power_from_bits(b, g, Gvec);
+ops.cmp   = ops.cmp + N;
+ops.div   = ops.div + sum(b > 0);
+ops.shift = ops.shift + 2*sum(b > 0);
+ops.add   = ops.add + sum(b > 0);
+end
+
+% ----------------------------------------------------------------------
+
+function [b, Pk, ops] = alloc_greedy_fill(g, P)
+%ALLOC_GREEDY_FILL  Greedy bit filling under a CONSTANT SNR gap.
+%
+%   Row 1 of Table I of Wang et al. (IEEE TVT 2010), attributed there to
+%   Baccarelli and Biagi, Signal Processing 2004 [13]. Bits are added one
+%   at a time to the sub-channel requiring the smallest incremental power,
+%   starting from the all-zero allocation.
+%
+%   Under a constant gap the incremental power is
+%       DeltaP+_k = 2^(b_k) * Gamma / g_k ,
+%   so each allocation simply doubles the previous value: one shift, which
+%   is the doubling shortcut the multi-level gap forfeits.
+%
+%   The counters follow the analytical entries of Table I:
+%     comparisons  eta*N^2       one minimum search over N per bit
+%     divisions    N             the initial Gamma/g_k
+%     additions    eta*N         one increment per bit
+%     shifts       eta*N         one doubling per bit
+%   The bit caps are charged with the same convention as the other
+%   allocators (one division and one comparison per entry, single row).
+
+N = P.N; Bt = P.Bt; Gc = P.Gap_const;
+ops = zeros_ops();
+
+cap = min(P.bmax, floor(log2(1 + (P.Pbar*g)/Gc)));
+ops.div = ops.div + N;
+ops.cmp = ops.cmp + N;
+
+b  = zeros(1,N);
+dP = Gc ./ g;                        % cost of the first bit
+ops.div = ops.div + N;
+dP(cap < 1) = Inf;                   % sub-channels that cannot carry a bit
+ops.cmp = ops.cmp + N;
+
+Gvec = Gc * ones(1, P.bmax);
+
+for n = 1:Bt
+    [mv, i] = min(dP);
+    ops.cmp = ops.cmp + (N-1);
+    ops.cmp = ops.cmp + 1;           % the isfinite test
+    if ~isfinite(mv); break; end     % target rate not attainable
+
+    b(i) = b(i) + 1;
+    ops.add = ops.add + 1;
+
+    ops.cmp = ops.cmp + 1;           % saturation test against the cap
+    if b(i) < cap(i)
+        dP(i) = 2*dP(i);             % doubling shortcut, constant gap only
+        ops.shift = ops.shift + 1;
+    else
+        dP(i) = Inf;
+    end
+end
+
+Pk = power_from_bits(b, g, Gvec);
+ops.cmp   = ops.cmp + N;
+ops.div   = ops.div + sum(b > 0);
+ops.shift = ops.shift + 2*sum(b > 0);
+ops.add   = ops.add + sum(b > 0);
+end
+
+% ----------------------------------------------------------------------
+
+function [b, Pk, ops] = alloc_greedy_remove(g, P)
+%ALLOC_GREEDY_REMOVE  Greedy bit removal under a CONSTANT SNR gap.
+%
+%   Row 2 of Table I of Wang et al. (IEEE TVT 2010), attributed there to
+%   Fasano [15]. The dual of ALLOC_GREEDY_FILL: the allocation starts at
+%   the maximum rate permitted by the bit caps, and bits are removed one
+%   at a time from the sub-channel returning the largest power, until the
+%   target rate is reached.
+%
+%   Under a constant gap the power released by removing the b_k-th bit is
+%       DeltaP-_k = 2^(b_k - 1) * Gamma / g_k ,
+%   which is halved after each removal: again one shift.
+%
+%   The counters follow the analytical entries of Table I:
+%     comparisons  (lambda-eta)*N^2
+%     divisions    N
+%     additions    (lambda-eta)*N
+%     shifts       (2*lambda-eta-1)*N
+%   the shift count being the sum of (b_k - 1) initialisation shifts and
+%   one halving per removed bit.
+
+N = P.N; Bt = P.Bt; Gc = P.Gap_const;
+ops = zeros_ops();
+
+cap = min(P.bmax, floor(log2(1 + (P.Pbar*g)/Gc)));
+ops.div = ops.div + N;
+ops.cmp = ops.cmp + N;
+
+b = cap;                             % maximum rate allocation
+u = Gc ./ g;
+ops.div = ops.div + N;
+
+dP = (2.^max(b-1,0)) .* u;           % power released by the last bit
+ops.shift = ops.shift + sum(max(b-1,0));
+dP(b < 1) = -Inf;                    % nothing left to remove
+ops.cmp = ops.cmp + N;
+
+Gvec = Gc * ones(1, P.bmax);
+
+% If the caps cannot even reach the target, deliver the largest feasible
+% rate rather than violate the per-sub-channel constraint.
+nrem = sum(b) - Bt;
+ops.add = ops.add + 1;
+
+for n = 1:max(nrem,0)
+    [mv, i] = max(dP);
+    ops.cmp = ops.cmp + (N-1);
+    ops.cmp = ops.cmp + 1;           % the isfinite test
+    if ~isfinite(mv); break; end
+
+    b(i) = b(i) - 1;
+    ops.add = ops.add + 1;
+
+    ops.cmp = ops.cmp + 1;           % the b > 0 test
+    if b(i) > 0
+        dP(i) = dP(i)/2;
+        ops.shift = ops.shift + 1;
+    else
+        dP(i) = -Inf;
+    end
+end
+
+Pk = power_from_bits(b, g, Gvec);
+ops.cmp   = ops.cmp + N;
+ops.div   = ops.div + sum(b > 0);
+ops.shift = ops.shift + 2*sum(b > 0);
+ops.add   = ops.add + sum(b > 0);
+end
+
+%% ======================================================================
+%  EVALUATION
+%% ======================================================================
+
+function out = achieved_ser(b, Pk, g, P)
+%ACHIEVED_SER  Symbol error rate actually obtained on each sub-channel.
+%
+.
+%
+%   OUTPUT struct
+%     .ser_k      1xN achieved SER (NaN on unused sub-channels)
+%     .ser_level  1xL mean achieved SER per modulation level
+%     .worst      worst achieved SER over all active sub-channels
+%     .n_viol     number of sub-channels exceeding the target SER
+%     .max_ratio  worst achieved SER divided by the target
+
+N = P.N; L = numel(P.levels);
+gam = Pk .* g;                       % SNR actually available
+ser_k = nan(1,N);
+
+for l = 1:L
+    m = (b == l);
+    if any(m)
+        ser_k(m) = ser_of_gamma(gam(m), P.levels(l).M, P.levels(l).family);
+    end
+end
+
+out.ser_k = ser_k;
+out.ser_level = nan(1,L);
+for l = 1:L
+    m = (b == l);
+    if any(m); out.ser_level(l) = mean(ser_k(m)); end
+end
+
+act = ~isnan(ser_k);
+if any(act)
+    out.worst = max(ser_k(act));
+    out.n_viol = sum(ser_k(act) > P.SER_target*1.001);
+    out.max_ratio = out.worst / P.SER_target;
+else
+    out.worst = NaN; out.n_viol = 0; out.max_ratio = NaN;
+end
+end
+
+%% ======================================================================
+%  HELPERS
+%% ======================================================================
+
+function Pk = power_from_bits(b, g, Gap)
+%POWER_FROM_BITS  Power required by allocation b under gap table Gap.
+%   Uses the TRUE gap of the level actually carried by each sub-channel,
+%   i.e. P_k = (2^{b_k}-1) * Gamma_{b_k} / g_k.
+Pk = zeros(size(b));
+act = b > 0;
+Pk(act) = (2.^b(act) - 1) .* Gap(b(act)) ./ g(act);
+end
+
+function ops = zeros_ops()
+ops = struct('cmp',0,'div',0,'add',0,'shift',0);
+end
